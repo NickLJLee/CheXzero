@@ -5,14 +5,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm.notebook import tqdm
 
-from PIL import Image
 import h5py
 
 import torch
 from torch.utils import data
 from torch import nn
 import torch.optim as optim
-from torchvision.transforms import Compose, Normalize, Resize, InterpolationMode
 
 import sys
 sys.path.append('../..')
@@ -21,50 +19,98 @@ import clip
 from model import CLIP
 from simple_tokenizer import SimpleTokenizer
 
-class CXRDataset(data.Dataset):
-    """Represents an abstract HDF5 dataset.
-    
-    Input params:
-        file_path: Path to the folder containing the dataset (one or multiple HDF5 files).
-        recursive: If True, searches for h5 files in subdirectories.
-        load_data: If True, loads all the data immediately into RAM. Use this if
-            the dataset is fits into memory. Otherwise, leave this at false and 
-            the data will load lazily.
-        data_cache_size: Number of HDF5 files that can be cached in the cache (default=3).
-        transform: PyTorch transform to apply to every data instance (default=None).
-    """
-    def __init__(self, img_path, txt_path, column='report', size=None, transform=None):
-        super().__init__()
-        if size != None: 
-            self.img_dset = h5py.File(img_path, 'r')['cxr_unprocessed'][:size]
-            self.txt_dset = pd.read_csv(txt_path)[column][:size]
-        else: 
-            self.img_dset = h5py.File(img_path, 'r')['cxr_unprocessed']
-            self.txt_dset = pd.read_csv(txt_path)[column]
-        self.transform = transform
-            
-    def __len__(self):
-        return len(self.txt_dset)
-    
-    def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-            
-        img = self.img_dset[idx] # np array, (320, 320)
-        img = np.expand_dims(img, axis=0)
-        img = np.repeat(img, 3, axis=0)
-        txt = self.txt_dset[idx] # python str
-        if type(txt) == type(float("nan")): # capture the case of empty "Impression" sections
-            txt = " "
+import torch
+from torch.utils.data import Dataset
+import torch
+from torch.utils import data
+import matplotlib.pyplot as plt
+import h5py
+import pandas as pd
+import numpy as np
+import os
 
-        img = torch.from_numpy(img) # torch, (3, 320, 320)
-        if self.transform:
-            img = self.transform(img)
-        sample = {'img': img, 'txt': txt }
+class ECGDataset(Dataset):
+    def __init__(self, txt_path, ecg_path):
+        self.window_size = 2500
+        self.fs = 250.0
+        self.data = pd.read_csv(txt_path)
+        # Drop rows where HashFileName or deid_t_diagnosis_original is NaN
+        self.data = self.data.dropna(subset=['HashFileName', 'deid_t_diagnosis_original'])
+        self.ecg_path = ecg_path
+        self.leads = ['I', 'II', 'III', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'aVF', 'aVL', 'aVR']
+
+    def __len__(self):
+        return len(self.data)
+
+    def resample_unequal(self, ts, fs_in, fs_out):
+        if fs_in == 0:
+            return ts
+        t = len(ts) / fs_in
+        fs_in, fs_out = int(fs_in), int(fs_out)
+        if fs_out == fs_in:
+            return ts
+        if 2*fs_out == fs_in:
+            return ts[::2]
+        else:
+            x_old = np.linspace(0, 1, num=len(ts), endpoint=True)
+            x_new = np.linspace(0, 1, num=t*fs_out, endpoint=True)
+            y_old = ts
+            f = interp1d(x_old, y_old, kind='linear')
+            y_new = f(x_new)
+            return y_new
+    
+    def preprocess(self, arr, sample_rate):
+        """
+        arr has shape (n_channel, n_length)
+
+        """
+        out = []
+        for tmp in arr:
+
+            # resample
+            if sample_rate != self.fs:
+                tmp = self.resample_unequal(tmp, sample_rate, self.fs)
+
+            # filter
+            # tmp = notch_filter(tmp, self.fs, 60, verbose='ERROR')
+            # tmp = filter_data(tmp, self.fs, 0.5, 50, verbose='ERROR')
+
+            out.append(tmp)
+
+        out = np.array(out)
+        n_length = out.shape[1]
+
+        if n_length > self.window_size: # crop center window_size for longer
+            i_start = (n_length-self.window_size)//2
+            i_end = i_start+self.window_size
+            out = out[:, i_start:i_end]
+        elif n_length < self.window_size: # pad zeros for shorter
+            pad_len = np.zeros((self.n_leads, self.window_size-n_length))
+            out = np.concatenate([out, pad_len], axis=1)
+
+        return out
         
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        hash_file_name = row['HashFileName']
+        diagnosis = row['deid_t_diagnosis_original']
+        hd5_file = h5py.File(f"{self.ecg_path}/{hash_file_name}", "r")
+        
+        # Load the corresponding hd5 file for ECG data
+        for k in list(hd5_file['ecg'].keys()):
+            ecg_data_list = [torch.tensor(hd5_file['ecg'][k][lead][:]) for lead in self.leads]
+            ecg_data = torch.stack(ecg_data_list, dim=0)
+            sample_rate = float(hd5_file['ecg'][k]['ecgsamplebase_pc'][()])
+        
+    
+        ecg_data = np.array(ecg_data, dtype=np.float64)
+        ecg_data = self.preprocess(ecg_data, sample_rate)
+        ecg_data = torch.tensor(ecg_data, dtype=torch.float)
+
+        sample = {'ecg': ecg_data, 'txt': diagnosis }
         return sample
 
-def load_data(cxr_filepath, txt_filepath, batch_size=4, column='report', pretrained=False, verbose=False): 
+def load_data(ecg_path, txt_path, batch_size=128, column='deid_t_diagnosis_original'): 
     if torch.cuda.is_available():  
         dev = "cuda:0" 
         cuda_available = True
@@ -72,43 +118,24 @@ def load_data(cxr_filepath, txt_filepath, batch_size=4, column='report', pretrai
     else:  
         dev = "cpu"  
         cuda_available = False
-        print('Using cpu.')
+        print('Using CPU.')
     
     device = torch.device(dev)
     
     if cuda_available: 
         torch.cuda.set_device(device)
-
-    if pretrained: 
-        input_resolution = 224
-        transform = Compose([
-            Normalize((101.48761, 101.48761, 101.48761), (83.43944, 83.43944, 83.43944)),
-            Resize(input_resolution, interpolation=InterpolationMode.BICUBIC),
-        ])
-        print('Interpolation Mode: ', InterpolationMode.BICUBIC)
-        print("Finished image transforms for pretrained model.")
-    else: 
-        input_resolution = 320
-        transform = Compose([
-            Normalize((101.48761, 101.48761, 101.48761), (83.43944, 83.43944, 83.43944)),
-        ])
-        print("Finished image transforms for clip model.")
     
-    torch_dset = CXRDataset(img_path=cxr_filepath,
-                        txt_path=txt_filepath, column=column, transform=transform)
+    torch_dset = ECGDataset(ecg_path=ecg_path, txt_path=txt_path)
+    data_loader = data.DataLoader(torch_dset, batch_size=batch_size, shuffle=True, num_workers=os.cpu_count())
     
-    if verbose: 
-        for i in range(len(torch_dset)):
-            sample = torch_dset[i]
-            plt.imshow(sample['img'][0])
-            plt.show()
-            print(i, sample['img'].size(), sample['txt'])
-            if i == 3:
-                break
-    
-    loader_params = {'batch_size':batch_size, 'shuffle': True, 'num_workers': 0}
-    data_loader = data.DataLoader(torch_dset, **loader_params)
     return data_loader, device
+    
+# Testing the dataset with the provided files
+#cxr_filepath = '/home/ubuntu/data'
+#txt_filepath = '/home/ubuntu/data/sample.csv'
+#dataset = ECGDataset(txt_filepath, cxr_filepath)
+#ECGdataloader,dev = load_data(txt_path = txt_filepath, ecg_path = cxr_filepath)
+
     
 def load_clip(model_path=None, pretrained=False, context_length=77):
     '''
@@ -127,11 +154,6 @@ def load_clip(model_path=None, pretrained=False, context_length=77):
     '''
 
     params = {
-        'embed_dim':768,
-        'image_resolution': 320,
-        'vision_layers': 12,
-        'vision_width': 768,
-        'vision_patch_size': 16,
         'context_length': context_length,
         'vocab_size': 49408,
         'transformer_width': 512,
@@ -173,6 +195,7 @@ def preprocess_text(texts, model):
         result[i, :len(tokens)] = torch.tensor(tokens)
     return result
 
+"""
 def make(config, cxr_filepath, txt_filepath, model_path=None): 
     '''
     FUNCTION: make
@@ -225,3 +248,4 @@ def train_main(cxr_filepath, txt_filepath, hyperparams, output_path, model_path=
     optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=momentum)
     train_clip(model, data_loader, device, criterion, optimizer, epochs, output_path)
     return model
+"""

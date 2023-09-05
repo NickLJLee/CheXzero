@@ -13,13 +13,13 @@ import clip
 from model import CLIP
 from simple_tokenizer import SimpleTokenizer
 
-from train import train_main, load_data, load_clip, preprocess_text
+from train import load_data, load_clip, preprocess_text
 from zero_shot import run_cxr_zero_shot, run_zero_shot
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cxr_filepath', type=str, default='data/cxr.h5', help="Directory to load chest x-ray image data from.")
-    parser.add_argument('--txt_filepath', type=str, default='data/mimic_impressions.csv', help="Directory to load radiology report impressions text from.")
+    parser.add_argument('--cxr_filepath', type=str, default='/home/ubuntu/data', help="Directory to load chest x-ray image data from.")
+    parser.add_argument('--txt_filepath', type=str, default='/home/ubuntu/data/sample.csv', help="Directory to load radiology report impressions text from.")
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
@@ -51,9 +51,9 @@ def model_pipeline(config, verbose=0):
     return model
 
 def make(config): 
-    pretrained = not config.random_init
-    data_loader, device = load_data(config.cxr_filepath, config.txt_filepath, batch_size=config.batch_size, pretrained=pretrained, column="impression")
-    model = load_clip(model_path=None, pretrained=pretrained, context_length=config.context_length)
+    #pretrained = not config.random_init
+    data_loader, device = load_data(config.cxr_filepath, config.txt_filepath, batch_size=config.batch_size)
+    model = load_clip(model_path=None, pretrained=False, context_length=config.context_length)
     model.to(device)
     print('Model on Device.')
 
@@ -82,7 +82,7 @@ def train(model, loader, device, criterion, optimizer, config):
         running_loss = 0.0 # running loss over batch
         for data in tqdm(loader):
             # get the images
-            images = data['img']
+            images = data['ecg']
 
             texts = data['txt']
             texts = preprocess_text(texts, model) 

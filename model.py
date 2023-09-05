@@ -23,155 +23,396 @@ SOFTWARE.
 
 """
 from collections import OrderedDict
-from typing import Tuple, Union
-
 import numpy as np
+from collections import Counter
+from matplotlib import pyplot as plt
+import torch.nn.init as init
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-from torch import nn
+from torch.utils.data import Dataset
 
+class MyDataset(Dataset):
+    def __init__(self, data, label):
+        self.data = data
+        self.label = label
 
-class Bottleneck(nn.Module):
-    expansion = 4
+    def __getitem__(self, index):
+        return (torch.tensor(self.data[index], dtype=torch.float), torch.tensor(self.label[index], dtype=torch.long))
 
-    def __init__(self, inplanes, planes, stride=1):
-        super().__init__()
+    def __len__(self):
+        return len(self.data)
 
-        # all conv layers have stride 1. an avgpool is performed after the second convolution when stride > 1
-        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+class MyConv1dPadSame(nn.Module):
+    """
+    extend nn.Conv1d to support SAME padding
 
-        self.conv2 = nn.Conv2d(planes, planes, 3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.avgpool = nn.AvgPool2d(stride) if stride > 1 else nn.Identity()
-
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
-
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = None
+    input: (n_sample, in_channels, n_length)
+    output: (n_sample, out_channels, (n_length+stride-1)//stride)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, groups=1):
+        super(MyConv1dPadSame, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
         self.stride = stride
+        self.groups = groups
+        self.conv = torch.nn.Conv1d(
+            in_channels=self.in_channels, 
+            out_channels=self.out_channels, 
+            kernel_size=self.kernel_size, 
+            stride=self.stride, 
+            groups=self.groups)
 
-        if stride > 1 or inplanes != planes * Bottleneck.expansion:
-            # downsampling layer is prepended with an avgpool, and the subsequent convolution has stride 1
-            self.downsample = nn.Sequential(OrderedDict([
-                ("-1", nn.AvgPool2d(stride)),
-                ("0", nn.Conv2d(inplanes, planes * self.expansion, 1, stride=1, bias=False)),
-                ("1", nn.BatchNorm2d(planes * self.expansion))
-            ]))
+    def forward(self, x):
+        
+        net = x
+        
+        # compute pad shape
+        in_dim = net.shape[-1]
+        out_dim = (in_dim + self.stride - 1) // self.stride
+        p = max(0, (out_dim - 1) * self.stride + self.kernel_size - in_dim)
+        pad_left = p // 2
+        pad_right = p - pad_left
+        net = F.pad(net, (pad_left, pad_right), "constant", 0)
+        
+        net = self.conv(net)
 
-    def forward(self, x: torch.Tensor):
+        return net
+        
+class MyMaxPool1dPadSame(nn.Module):
+    """
+    extend nn.MaxPool1d to support SAME padding
+
+    params:
+        kernel_size: kernel size
+        stride: the stride of the window. Default value is kernel_size
+    
+    input: (n_sample, n_channel, n_length)
+    """
+    def __init__(self, kernel_size):
+        super(MyMaxPool1dPadSame, self).__init__()
+        self.kernel_size = kernel_size
+        self.max_pool = torch.nn.MaxPool1d(kernel_size=self.kernel_size)
+
+    def forward(self, x):
+        
+        net = x
+        
+        # compute pad shape
+        p = max(0, self.kernel_size - 1)
+        pad_left = p // 2
+        pad_right = p - pad_left
+        net = F.pad(net, (pad_left, pad_right), "constant", 0)
+        
+        net = self.max_pool(net)
+        
+        return net
+    
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class BasicBlock(nn.Module):
+    """
+    Basic Block: 
+        conv1 -> convk -> conv1
+
+    params:
+        in_channels: number of input channels
+        out_channels: number of output channels
+        ratio: ratio of channels to out_channels
+        kernel_size: kernel window length
+        stride: kernel step size
+        groups: number of groups in convk
+        downsample: whether downsample length
+        use_bn: whether use batch_norm
+        use_do: whether use dropout
+
+    input: (n_sample, in_channels, n_length)
+    output: (n_sample, out_channels, (n_length+stride-1)//stride)
+    """
+    def __init__(self, in_channels, out_channels, ratio, kernel_size, stride, groups, downsample, is_first_block=False, use_bn=True, use_do=True):
+        super(BasicBlock, self).__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.ratio = ratio
+        self.kernel_size = kernel_size
+        self.groups = groups
+        self.downsample = downsample
+        self.stride = stride if self.downsample else 1
+        self.is_first_block = is_first_block
+        self.use_bn = use_bn
+        self.use_do = use_do
+
+        self.middle_channels = int(self.out_channels * self.ratio)
+
+        # the first conv, conv1
+        self.bn1 = nn.BatchNorm1d(in_channels)
+        self.activation1 = Swish()
+        self.do1 = nn.Dropout(p=0.5)
+        self.conv1 = MyConv1dPadSame(
+            in_channels=self.in_channels, 
+            out_channels=self.middle_channels, 
+            kernel_size=1, 
+            stride=1,
+            groups=1)
+
+        # the second conv, convk
+        self.bn2 = nn.BatchNorm1d(self.middle_channels)
+        self.activation2 = Swish()
+        self.do2 = nn.Dropout(p=0.5)
+        self.conv2 = MyConv1dPadSame(
+            in_channels=self.middle_channels, 
+            out_channels=self.middle_channels, 
+            kernel_size=self.kernel_size, 
+            stride=self.stride,
+            groups=self.groups)
+
+        # the third conv, conv1
+        self.bn3 = nn.BatchNorm1d(self.middle_channels)
+        self.activation3 = Swish()
+        self.do3 = nn.Dropout(p=0.5)
+        self.conv3 = MyConv1dPadSame(
+            in_channels=self.middle_channels, 
+            out_channels=self.out_channels, 
+            kernel_size=1, 
+            stride=1,
+            groups=1)
+
+        # Squeeze-and-Excitation
+        r = 2
+        self.se_fc1 = nn.Linear(self.out_channels, self.out_channels//r)
+        self.se_fc2 = nn.Linear(self.out_channels//r, self.out_channels)
+        self.se_activation = Swish()
+
+        if self.downsample:
+            self.max_pool = MyMaxPool1dPadSame(kernel_size=self.stride)
+
+    def forward(self, x):
+        
         identity = x
+        
+        out = x
+        # the first conv, conv1
+        if not self.is_first_block:
+            if self.use_bn:
+                out = self.bn1(out)
+            out = self.activation1(out)
+            if self.use_do:
+                out = self.do1(out)
+        out = self.conv1(out)
+        
+        # the second conv, convk
+        if self.use_bn:
+            out = self.bn2(out)
+        out = self.activation2(out)
+        if self.use_do:
+            out = self.do2(out)
+        out = self.conv2(out)
+        
+        # the third conv, conv1
+        if self.use_bn:
+            out = self.bn3(out)
+        out = self.activation3(out)
+        if self.use_do:
+            out = self.do3(out)
+        out = self.conv3(out) # (n_sample, n_channel, n_length)
 
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.relu(self.bn2(self.conv2(out)))
-        out = self.avgpool(out)
-        out = self.bn3(self.conv3(out))
-
-        if self.downsample is not None:
-            identity = self.downsample(x)
-
+        # Squeeze-and-Excitation
+        se = out.mean(-1) # (n_sample, n_channel)
+        se = self.se_fc1(se)
+        se = self.se_activation(se)
+        se = self.se_fc2(se)
+        se = torch.sigmoid(se) # (n_sample, n_channel)
+        out = torch.einsum('abc,ab->abc', out, se)
+        
+        # if downsample, also downsample identity
+        if self.downsample:
+            identity = self.max_pool(identity)
+            
+        # if expand channel, also pad zeros to identity
+        if self.out_channels != self.in_channels:
+            identity = identity.transpose(-1,-2)
+            ch1 = (self.out_channels-self.in_channels)//2
+            ch2 = self.out_channels-self.in_channels-ch1
+            identity = F.pad(identity, (ch1, ch2), "constant", 0)
+            identity = identity.transpose(-1,-2)
+        
+        # shortcut
         out += identity
-        out = self.relu(out)
+
         return out
 
+class BasicStage(nn.Module):
+    """
+    Basic Stage:
+        block_1 -> block_2 -> ... -> block_M
+    """
+    def __init__(self, in_channels, out_channels, ratio, kernel_size, stride, groups, i_stage, m_blocks, use_bn=True, use_do=True, verbose=False):
+        super(BasicStage, self).__init__()
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.ratio = ratio
+        self.kernel_size = kernel_size
+        self.groups = groups
+        self.i_stage = i_stage
+        self.m_blocks = m_blocks
+        self.use_bn = use_bn
+        self.use_do = use_do
+        self.verbose = verbose
 
-class AttentionPool2d(nn.Module):
-    def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
-        super().__init__()
-        self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
-        self.k_proj = nn.Linear(embed_dim, embed_dim)
-        self.q_proj = nn.Linear(embed_dim, embed_dim)
-        self.v_proj = nn.Linear(embed_dim, embed_dim)
-        self.c_proj = nn.Linear(embed_dim, output_dim or embed_dim)
-        self.num_heads = num_heads
+        self.block_list = nn.ModuleList()
+        for i_block in range(self.m_blocks):
+            
+            # first block
+            if self.i_stage == 0 and i_block == 0:
+                self.is_first_block = True
+            else:
+                self.is_first_block = False
+            # downsample, stride, input
+            if i_block == 0:
+                self.downsample = True
+                self.stride = stride
+                self.tmp_in_channels = self.in_channels
+            else:
+                self.downsample = False
+                self.stride = 1
+                self.tmp_in_channels = self.out_channels
+            
+            # build block
+            tmp_block = BasicBlock(
+                in_channels=self.tmp_in_channels, 
+                out_channels=self.out_channels, 
+                ratio=self.ratio, 
+                kernel_size=self.kernel_size, 
+                stride=self.stride, 
+                groups=self.groups, 
+                downsample=self.downsample, 
+                is_first_block=self.is_first_block,
+                use_bn=self.use_bn, 
+                use_do=self.use_do)
+            self.block_list.append(tmp_block)
 
     def forward(self, x):
-        x = x.reshape(x.shape[0], x.shape[1], x.shape[2] * x.shape[3]).permute(2, 0, 1)  # NCHW -> (HW)NC
-        x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
-        x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
-        x, _ = F.multi_head_attention_forward(
-            query=x, key=x, value=x,
-            embed_dim_to_check=x.shape[-1],
-            num_heads=self.num_heads,
-            q_proj_weight=self.q_proj.weight,
-            k_proj_weight=self.k_proj.weight,
-            v_proj_weight=self.v_proj.weight,
-            in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
-            bias_k=None,
-            bias_v=None,
-            add_zero_attn=False,
-            dropout_p=0,
-            out_proj_weight=self.c_proj.weight,
-            out_proj_bias=self.c_proj.bias,
-            use_separate_proj_weight=True,
-            training=self.training,
-            need_weights=False
-        )
 
-        return x[0]
+        out = x
 
+        for i_block in range(self.m_blocks):
+            net = self.block_list[i_block]
+            out = net(out)
+            if self.verbose:
+                print('stage: {}, block: {}, in_channels: {}, out_channels: {}, outshape: {}'.format(self.i_stage, i_block, net.in_channels, net.out_channels, list(out.shape)))
+                print('stage: {}, block: {}, conv1: {}->{} k={} s={} C={}'.format(self.i_stage, i_block, net.conv1.in_channels, net.conv1.out_channels, net.conv1.kernel_size, net.conv1.stride, net.conv1.groups))
+                print('stage: {}, block: {}, convk: {}->{} k={} s={} C={}'.format(self.i_stage, i_block, net.conv2.in_channels, net.conv2.out_channels, net.conv2.kernel_size, net.conv2.stride, net.conv2.groups))
+                print('stage: {}, block: {}, conv1: {}->{} k={} s={} C={}'.format(self.i_stage, i_block, net.conv3.in_channels, net.conv3.out_channels, net.conv3.kernel_size, net.conv3.stride, net.conv3.groups))
 
-class ModifiedResNet(nn.Module):
+        return out
+
+class Net1D(nn.Module):
     """
-    A ResNet class that is similar to torchvision's but contains the following changes:
-    - There are now 3 "stem" convolutions as opposed to 1, with an average pool instead of a max pool.
-    - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1
-    - The final pooling layer is a QKV attention instead of an average pool
+    
+    Input:
+        X: (n_samples, n_channel, n_length)
+        Y: (n_samples)
+        
+    Output:
+        out: (n_samples)
+        
+    params:
+        in_channels
+        base_filters
+        filter_list: list, filters for each stage
+        m_blocks_list: list, number of blocks of each stage
+        kernel_size
+        stride
+        groups_width
+        n_stages
+        n_classes
+        use_bn
+        use_do
+
     """
 
-    def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
-        super().__init__()
-        self.output_dim = output_dim
-        self.input_resolution = input_resolution
+    def __init__(self, in_channels, base_filters, ratio, filter_list, m_blocks_list, kernel_size, stride, groups_width, n_classes, use_bn=True, use_do=True, return_features=False, verbose=False):
+        super(Net1D, self).__init__()
+        
+        self.in_channels = in_channels
+        self.base_filters = base_filters
+        self.ratio = ratio
+        self.filter_list = filter_list
+        self.m_blocks_list = m_blocks_list
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.groups_width = groups_width
+        self.n_stages = len(filter_list)
+        self.n_classes = n_classes
+        self.use_bn = use_bn
+        self.use_do = use_do
+        self.return_features = return_features
+        self.verbose = verbose
 
-        # the 3-layer stem
-        self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(width // 2)
-        self.conv2 = nn.Conv2d(width // 2, width // 2, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(width // 2)
-        self.conv3 = nn.Conv2d(width // 2, width, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(width)
-        self.avgpool = nn.AvgPool2d(2)
-        self.relu = nn.ReLU(inplace=True)
+        # first conv
+        self.first_conv = MyConv1dPadSame(
+            in_channels=in_channels, 
+            out_channels=self.base_filters, 
+            kernel_size=self.kernel_size, 
+            stride=2)
+        self.first_bn = nn.BatchNorm1d(base_filters)
+        self.first_activation = Swish()
 
-        # residual layers
-        self._inplanes = width  # this is a *mutable* variable used during construction
-        self.layer1 = self._make_layer(width, layers[0])
-        self.layer2 = self._make_layer(width * 2, layers[1], stride=2)
-        self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
-        self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
+        # stages
+        self.stage_list = nn.ModuleList()
+        in_channels = self.base_filters
+        for i_stage in range(self.n_stages):
 
-        embed_dim = width * 32  # the ResNet feature dimension
-        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim)
+            out_channels = self.filter_list[i_stage]
+            m_blocks = self.m_blocks_list[i_stage]
+            tmp_stage = BasicStage(
+                in_channels=in_channels, 
+                out_channels=out_channels, 
+                ratio=self.ratio, 
+                kernel_size=self.kernel_size, 
+                stride=self.stride, 
+                groups=out_channels//self.groups_width, 
+                i_stage=i_stage,
+                m_blocks=m_blocks, 
+                use_bn=self.use_bn, 
+                use_do=self.use_do, 
+                verbose=self.verbose)
+            self.stage_list.append(tmp_stage)
+            in_channels = out_channels
 
-    def _make_layer(self, planes, blocks, stride=1):
-        layers = [Bottleneck(self._inplanes, planes, stride)]
-
-        self._inplanes = planes * Bottleneck.expansion
-        for _ in range(1, blocks):
-            layers.append(Bottleneck(self._inplanes, planes))
-
-        return nn.Sequential(*layers)
+        # final prediction
+        self.dense = nn.Linear(in_channels, n_classes)
 
     def forward(self, x):
-        def stem(x):
-            for conv, bn in [(self.conv1, self.bn1), (self.conv2, self.bn2), (self.conv3, self.bn3)]:
-                x = self.relu(bn(conv(x)))
-            x = self.avgpool(x)
-            return x
+        x = x.type(self.first_conv.conv.weight.dtype)
+        out = x
+        
+        # first conv
+        out = self.first_conv(out)
+        if self.use_bn:
+            out = self.first_bn(out)
+        out = self.first_activation(out)
+        
+        # stages
+        for i_stage in range(self.n_stages):
+            net = self.stage_list[i_stage]
+            out = net(out)
 
-        x = x.type(self.conv1.weight.dtype)
-        x = stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        x = self.attnpool(x)
-
-        return x
+        # final prediction
+        deep_features = out.mean(-1)
+        #out = self.dense(deep_features)
+        return deep_features
+        #out = torch.sigmoid(out)
+        #if self.return_features:
+        #    return out, deep_features
+        #else:
+        #    return out
 
 
 class LayerNorm(nn.LayerNorm):
@@ -223,51 +464,11 @@ class Transformer(nn.Module):
         return self.resblocks(x)
 
 
-class VisualTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.output_dim = output_dim
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
-
-        scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
-
-        self.transformer = Transformer(width, layers, heads)
-
-        self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
-
-    def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
-
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        x = self.ln_post(x[:, 0, :])
-
-        if self.proj is not None:
-            x = x @ self.proj
-
-        return x
-
 
 class CLIP(nn.Module):
     def __init__(self,
-                 embed_dim: int,
-                 # vision
-                 image_resolution: int,
-                 vision_layers: Union[Tuple[int, int, int, int], int],
-                 vision_width: int,
-                 vision_patch_size: int,
+                 
+                 # ecg
                  # text
                  context_length: int,
                  vocab_size: int,
@@ -279,26 +480,20 @@ class CLIP(nn.Module):
 
         self.context_length = context_length
 
-        if isinstance(vision_layers, (tuple, list)):
-            vision_heads = vision_width * 32 // 64
-            self.visual = ModifiedResNet(
-                layers=vision_layers,
-                output_dim=embed_dim,
-                heads=vision_heads,
-                input_resolution=image_resolution,
-                width=vision_width
-            )
-        else:
-            vision_heads = vision_width // 64
-            self.visual = VisualTransformer(
-                input_resolution=image_resolution,
-                patch_size=vision_patch_size,
-                width=vision_width,
-                layers=vision_layers,
-                heads=vision_heads,
-                output_dim=embed_dim
-            )
-
+        self.resnet = Net1D(
+                in_channels=12, 
+                base_filters=64, 
+                ratio=1, 
+                filter_list=[64,160,160,400,400,1024,1024], 
+                m_blocks_list=[2,2,2,3,3,4,4], 
+                kernel_size=16, 
+                stride=2, 
+                groups_width=16,
+                verbose=False, 
+                use_bn=True,
+                n_classes=1
+        )
+       
         self.transformer = Transformer(
             width=transformer_width,
             layers=transformer_layers,
@@ -311,7 +506,7 @@ class CLIP(nn.Module):
         self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
         self.ln_final = LayerNorm(transformer_width)
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
+        self.text_projection = nn.Parameter(torch.empty(transformer_width, 1024))
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.initialize_parameters()
@@ -319,19 +514,6 @@ class CLIP(nn.Module):
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
-
-        if isinstance(self.visual, ModifiedResNet):
-            if self.visual.attnpool is not None:
-                std = self.visual.attnpool.c_proj.in_features ** -0.5
-                nn.init.normal_(self.visual.attnpool.q_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.k_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.v_proj.weight, std=std)
-                nn.init.normal_(self.visual.attnpool.c_proj.weight, std=std)
-
-            for resnet_block in [self.visual.layer1, self.visual.layer2, self.visual.layer3, self.visual.layer4]:
-                for name, param in resnet_block.named_parameters():
-                    if name.endswith("bn3.weight"):
-                        nn.init.zeros_(param)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
@@ -355,10 +537,11 @@ class CLIP(nn.Module):
 
     @property
     def dtype(self):
-        return self.visual.conv1.weight.dtype
+        return self.resnet.first_conv.conv.weight.dtype
 
     def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+        #dtype = self.resnet.first_conv.weight.dtype
+        return self.resnet(image.type(self.dtype))
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
@@ -374,7 +557,7 @@ class CLIP(nn.Module):
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
 
         return x
-
+  
     def forward(self, image, text):
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)

@@ -18,13 +18,13 @@ from zero_shot import run_cxr_zero_shot, run_zero_shot
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cxr_filepath', type=str, default='/home/ubuntu/data', help="Directory to load chest x-ray image data from.")
-    parser.add_argument('--txt_filepath', type=str, default='/home/ubuntu/data/sample.csv', help="Directory to load radiology report impressions text from.")
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--cxr_filepath', type=str, default='/home/ubuntu/data/ecg', help="Directory to load chest x-ray image data from.")
+    parser.add_argument('--txt_filepath', type=str, default='/home/ubuntu/data/combined_ecg_diagnosis.csv', help="Directory to load radiology report impressions text from.")
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--save_interval', type=int, default=100)
-    parser.add_argument('--log_interval', type=int, default=10)
+    parser.add_argument('--save_interval', type=int, default=1000)
+    parser.add_argument('--log_interval', type=int, default=1000)
     parser.add_argument('--save_dir', type=str, default="checkpoints/", help="Directory to save the trained model.")
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--optimizer', type=str, default="sgd")
@@ -77,7 +77,9 @@ def train(model, loader, device, criterion, optimizer, config):
     batch_ct = 0
     report_freq = config.log_interval
     highest_val_auc = 0 # save highest mean auc
-    
+    #if torch.cuda.device_count() > 1:
+    #  gpus = [0, 1, 2, 3, 4, 5, 6, 7]
+    #  model = nn.DataParallel(model.to(device), device_ids=gpus, output_device=gpus[0])
     for epoch in range(config.epochs):
         running_loss = 0.0 # running loss over batch
         for data in tqdm(loader):
@@ -86,7 +88,7 @@ def train(model, loader, device, criterion, optimizer, config):
 
             texts = data['txt']
             texts = preprocess_text(texts, model) 
-            
+
             # perform step for a single batch
             loss = train_batch(images, texts, model, device, criterion, optimizer)
             example_ct +=  len(images)

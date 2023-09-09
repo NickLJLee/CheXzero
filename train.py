@@ -85,7 +85,7 @@ class ECGDataset(Dataset):
             i_end = i_start+self.window_size
             out = out[:, i_start:i_end]
         elif n_length < self.window_size: # pad zeros for shorter
-            pad_len = np.zeros((self.n_leads, self.window_size-n_length))
+            pad_len = np.zeros((len(self.leads), self.window_size-n_length))
             out = np.concatenate([out, pad_len], axis=1)
 
         return out
@@ -94,21 +94,63 @@ class ECGDataset(Dataset):
         row = self.data.iloc[idx]
         hash_file_name = row['HashFileName']
         diagnosis = row['deid_t_diagnosis_original']
-        hd5_file = h5py.File(f"{self.ecg_path}/{hash_file_name}", "r")
-        
-        # Load the corresponding hd5 file for ECG data
-        for k in list(hd5_file['ecg'].keys()):
+
+        s_dirs = [f"S{i:04d}" for i in range(1, 5)] # Assuming there are only 4 'S' directories, modify as needed
+        year_dirs = [str(i) for i in range(1987, 2024)] # Assuming years range from 1980 to 2020
+        month_dirs = [f"{i:02}" for i in range(1, 13)]
+        try:
+        # Iterate over all possible combinations to find the file
+          file_found = False
+          for s_dir in s_dirs:
+              for year_dir in year_dirs:
+                  for month_dir in month_dirs:
+                      file_path = f"{self.ecg_path}/{s_dir}/{year_dir}/{month_dir}/{hash_file_name}"
+                      if os.path.exists(file_path):
+                          hd5_file = h5py.File(file_path, "r")
+                          file_found = True
+                          break
+                  if file_found:
+                      break
+              if file_found:
+                  break
+          #hd5_file = h5py.File(f"{self.ecg_path}/{hash_file_name}", "r")
+          for k in list(hd5_file['ecg'].keys()):
             ecg_data_list = [torch.tensor(hd5_file['ecg'][k][lead][:]) for lead in self.leads]
             ecg_data = torch.stack(ecg_data_list, dim=0)
             sample_rate = float(hd5_file['ecg'][k]['ecgsamplebase_pc'][()])
         
     
-        ecg_data = np.array(ecg_data, dtype=np.float64)
-        ecg_data = self.preprocess(ecg_data, sample_rate)
-        ecg_data = torch.tensor(ecg_data, dtype=torch.float)
+          ecg_data = np.array(ecg_data, dtype=np.float64)
+          ecg_data = self.preprocess(ecg_data, sample_rate)
+          ecg_data = torch.tensor(ecg_data, dtype=torch.float)
 
-        sample = {'ecg': ecg_data, 'txt': diagnosis }
-        return sample
+          sample = {'ecg': ecg_data, 'txt': diagnosis }
+          return sample
+    
+        except Exception as e:
+          print(f"Error reading file {file_path}: {e}")
+          normal_file_path = '/home/ubuntu/data/ecg/S0003/2010/02/de_115828429_20111219012630_20111219114122.hd5'
+          row1 = self.data.iloc[2]
+          diagnosis1 = row1['deid_t_diagnosis_original']
+          hd5_file1 = h5py.File(normal_file_path, "r")
+          for k in list(hd5_file1['ecg'].keys()):
+            ecg_data_list = [torch.tensor(hd5_file1['ecg'][k][lead][:]) for lead in self.leads]
+            ecg_data1 = torch.stack(ecg_data_list, dim=0)
+            sample_rate1 = float(hd5_file1['ecg'][k]['ecgsamplebase_pc'][()])
+        
+    
+            ecg_data1 = np.array(ecg_data1, dtype=np.float64)
+            ecg_data1 = self.preprocess(ecg_data1, sample_rate1)
+            ecg_data1 = torch.tensor(ecg_data1, dtype=torch.float)
+
+            sample1 = {'ecg': ecg_data1, 'txt': diagnosis1 }
+            return sample1
+        
+          #if not file_found:
+          #    raise ValueError(f"File {self.ecg_path}/{s_dir}/{year_dir}/{month_dir}/{hash_file_name} not found in the directory structure.")
+        
+        # Load the corresponding hd5 file for ECG data
+
 
 def load_data(ecg_path, txt_path, batch_size=128, column='deid_t_diagnosis_original'): 
     if torch.cuda.is_available():  
@@ -187,6 +229,7 @@ def preprocess_text(texts, model):
     eot_token = _tokenizer.encoder["<|endoftext|>"]
     all_tokens = [[sot_token] + _tokenizer.encode(text) + [eot_token] for text in texts]
     result = torch.zeros(len(all_tokens), model.context_length, dtype=torch.long)
+
     
     for i, tokens in enumerate(all_tokens):
         if len(tokens) > model.context_length:
